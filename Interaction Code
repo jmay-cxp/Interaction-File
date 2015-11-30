@@ -1,0 +1,348 @@
+<?php
+
+namespace Interaction;
+
+date_default_timezone_set("America/Boise");
+
+require getcwd().'/../db/db.php';
+require getcwd().'/../library/ftp/sftp.php';
+require getcwd().'/../library/ftp/local.php';
+require getcwd().'/../library/output/csv.php';
+require getcwd().'/../library/output/dsv.php';
+require getcwd().'/../library/email/email.php';
+
+use DB\DB;
+use FTP\SFTP as Transmitter;
+use FTP\Local as Local_Transmitter;
+use Output\CSV;
+use Output\DSV;
+use Email\Email;
+
+class  Interaction{
+	
+	private $db;
+	private $debug;
+	private $email_only;
+	private $env;
+	private $mysql_report_day;
+	private $noinfogroup;
+	private $mid_day_run;
+	private $interaction_data_table;
+	private $additional_info_str;
+	
+	const PRODUCTION = "production";
+	const TEST_PRODUCTION = "test";
+	const TEST_LOCAL = "local";
+
+	public function __construct(){
+		$command = getopt('',array('debug','emailonly','env:', 'help','runas:','noinfogroup','midday'));
+		
+		if(isset($command['help'])){
+			$this->getHelp();
+			exit();
+		}
+		
+		$this->env = self::PRODUCTION;
+		$this->email_only = false;
+		$this->noinfogroup = false;
+		$this->mid_day_run = false;
+
+		// These variables are for testing purposes
+		$this->interaction_data_table = "interaction_data";
+		$this->additional_info_str = ""; // This should be blank for production
+		
+		if(!empty($command['env'])){
+			if(in_array($command['env'], array(self::PRODUCTION,self::TEST_PRODUCTION,self::TEST_LOCAL))){
+				$this->env = $command['env'];
+			}else{
+				echo "Invalid usage\r\n\r\n";
+				$this->getHelp();
+				exit();
+			}
+		}
+		
+			
+		if(isset($command['emailonly']))
+			$this->email_only = true;
+			
+		if(isset($command['noinfogroup']))
+			$this->noinfogroup = true;
+		
+		if(isset($command['midday']))
+			$this->mid_day_run = true;
+		
+		if($this->mid_day_run)
+			$this->mysql_report_day = date('Y-m-d');
+		else
+			$this->mysql_report_day = date('Y-m-d',strtotime('00:01 yesterday'));
+		
+		if(!empty($command['runas'])){
+			$this->mysql_report_day = date('Y-m-d',strtotime($command['runas']));
+		}
+		
+		$this->debug = isset($command['debug']);
+		
+		$this->db = new DB(($this->debug?"debug/":"")."aetna.ods.config.php");
+		
+		$this->run();
+	}
+	
+	public function run(){
+		$headers = array("customer_id","contact_id","source_id","interaction_date","interaction_time","number_dialed","language_indicator","inbound_outbound","prospect_member_indicator","disposition_code","agent_id","ANI","first_name","middle_name","last_name","addr_line_1","addr_line_2","county","city","state","zip","territory","email","phone_number","email_opt_out","do_not_call","plan_interested_in_discussing","current_coverage","current_carrier","looking_for_coverage_reason","coverage_effective_date","medicaid_eligible","dental","enrollment_counter","campaign_code","kit_code","escalation_flag","seminar_id","future_effective_date","HV_scheduled_date","HV_scheduled_time","alternate_home_appointment_location","ivr_unique_id","Ethnicity","notes","plan_type");
+		// Populate Interaction Data Table
+		$this->db->sql = "INSERT IGNORE INTO `{$this->interaction_data_table}` (`customer_id`,`contact_id`,`source_id`,`date_dim_id`,`interaction_date`,`interaction_time`,`number_dialed`,`language_indicator`,`inbound_outbound`,`prospect_member_indicator`,`disposition_code`,`agent_id`,`ANI`,`first_name`,`middle_name`,`last_name`,`addr_line_1`,`addr_line_2`,`county`,`city`,`state`,`zip`,`territory`,`email`,`phone_number`,`email_opt_out`,`do_not_call`,`plan_interested_in_discussing`,`current_coverage`,`current_carrier`,`looking_for_coverage_reason`,`coverage_effective_date`,`medicaid_eligible`,`dental`,`enrollment_counter`,`campaign_code`,`queue_id`,`kit_code`,`escalation_flag`,`seminar_id`,`future_effective_date`,`HV_scheduled_date`,`HV_scheduled_time`,`alternate_home_appointment_location`,`ivr_unique_id`,`Ethnicity`,`notes`,`plan_type`,`interaction_file`)
+SELECT
+-- cl.cxp_customer_id AS customer_id, 
+UPPER(COALESCE(getCallResponseValue(9683, ch.call_history_id, cd.client_id), getCallResponseValue(971, ch.call_history_id, cd.client_id), CONCAT('CXP-', getUniqueCustomerId(cd.call_list_id, cd.client_id)))) AS customer_id,
+cdi.interaction_id AS contact_id,
+63 AS source_id,
+(SELECT id FROM cxp_date_dim WHERE actual_date = DATE(CONVERT_TZ(cd.start_time,'UTC','US/Mountain'))) date_dim_id,
+DATE_FORMAT(CONVERT_TZ(cd.start_time,'UTC','US/Eastern'), '%m/%d/%Y') AS interaction_date,
+TIME_FORMAT(CONVERT_TZ(cd.start_time,'UTC','US/Eastern'), '%h:%i:%s %p') AS interaction_time,
+CASE cd.call_type_id
+	WHEN 1 THEN SUBSTRING_INDEX(SUBSTRING_INDEX(cd.caller_id, '>', 1), '<', -1)
+	ELSE IFNULL(getAetnaTFN(cd.number_dialed), cd.number_dialed)
+END AS number_dialed,
+CASE WHEN IFNULL(ch.campaign_id, cd.campaign_id) IN (811,821,831) THEN 'S' ELSE 'E' END AS language_indicator, -- find out about IVR for spanish
+CASE cd.call_type_id WHEN 3 THEN 'I' ELSE 'O' END AS inbound_outbound,
+-- IF(COALESCE(getCallResponseValue(8290, ch.call_history_id, cd.client_id), getCallResponseValue(451, ch.call_history_id, cd.client_id)) = 'YES', 'M', 'P') AS prospect_member_indicator,
+CASE
+	WHEN ic.retention_flag = 1 THEN IFNULL(ci.prospect_member_indicator, 'R')
+	WHEN COALESCE(getCallResponseValue(8290, ch.call_history_id, cd.client_id), getCallResponseValue(451, ch.call_history_id, cd.client_id)) = 'YES' THEN 'M'
+	ELSE 'P'
+END AS prospect_member_indicator,
+COALESCE(getAetnaDispositionCode(ch.call_termination_id, ch.call_termination_type, ch.call_history_id, cd.client_id), 'I400') AS disposition_code,
+e.agent_id,
+CASE cd.call_type_id WHEN 1 THEN cd.number_dialed  ELSE SUBSTRING_INDEX(SUBSTRING_INDEX(cd.caller_id, '>', 1), '<', -1) END AS ANI,
+UPPER(COALESCE(ch.first_name, getCallResponseValue(8231, ch.call_history_id, cd.client_id), getCallResponseValue(2751, ch.call_history_id, cd.client_id))) AS first_name,
+UPPER(COALESCE(getCallResponseValue(1081, ch.call_history_id, cd.client_id), getCallResponseValue(2761, ch.call_history_id, cd.client_id)))  AS middle_name,
+UPPER(COALESCE(ch.last_name, getCallResponseValue(8230, ch.call_history_id, cd.client_id), getCallResponseValue(2771, ch.call_history_id, cd.client_id))) AS last_name,
+UPPER(COALESCE(ch.street_addr_1, getCallResponseValue(2121, ch.call_history_id, cd.client_id))) AS addr_line_1,
+UPPER(getCallResponseValue(151, ch.call_history_id, cd.client_id)) AS addr_line_2,
+UPPER(getCallResponseValue(191, ch.call_history_id, cd.client_id)) AS county,
+UPPER(COALESCE(ch.city, getCallResponseValue(2131, ch.call_history_id, cd.client_id))) AS city,
+UPPER(COALESCE(ch.state, getCallResponseValue(2141, ch.call_history_id, cd.client_id))) AS state,
+UPPER(COALESCE(ch.postal_code, getCallResponseValue(3631, ch.call_history_id, cd.client_id))) AS zip,
+UPPER(getCallResponseValue(6621, ch.call_history_id, cd.client_id)) AS territory,
+UPPER(COALESCE(ch.email_addr, getCallResponseValue(6781, ch.call_history_id, cd.client_id), getCallResponseValue(8254, ch.call_history_id, cd.client_id))) AS email,
+COALESCE(getCallResponseValue(7741, ch.call_history_id, cd.client_id), getCallResponseValue(8544, ch.call_history_id, cd.client_id), ch.phone_number) AS phone_number,
+'N' AS email_opt_out, -- Y/N
+CASE WHEN call_termination_id = 13 THEN 'Y' ELSE 'N' END AS do_not_call, -- Y/N
+REPLACE(COALESCE(
+	getCallResponseValue(2021, ch.call_history_id, cd.client_id), 
+	getCallResponseValue(8803, ch.call_history_id, cd.client_id), 
+	getCallResponseValue(8785, ch.call_history_id, cd.client_id), 
+	getCallResponseValue(8275, ch.call_history_id, cd.client_id),
+	getCallResponseValue(9851, ch.call_history_id, cd.client_id),
+	ci.product), 'MA / MAPD', 'MA') AS plan_interested_in_discussing,
+NULL AS current_coverage,
+NULL AS current_carrier,
+UPPER(getSepReason(ch.call_history_id, cd.client_id)) AS looking_for_coverage_reason, -- TODO
+IFNULL(getCallResponseValue(1421, ch.call_history_id, cd.client_id),getCallResponseValue(7881, ch.call_history_id, cd.client_id)) AS coverage_effective_date,
+CASE WHEN getCallResponseValue(4741, ch.call_history_id, cd.client_id) IS NOT NULL THEN 'Y' ELSE 'N' END AS medicaid_eligible, -- Y/N
+CASE WHEN IFNULL(getCallResponseValue(2601, ch.call_history_id, cd.client_id),IFNULL(getCallResponseValue(2611, ch.call_history_id, cd.client_id),getCallResponseValue(1441, ch.call_history_id, cd.client_id))) IS NOT NULL THEN 'Y' ELSE 'N' END AS dental, -- Y/N
+SUM(IF(getAetnaDispositionCode(ch.call_termination_id, ch.call_termination_type, ch.call_history_id, cd.client_id) IN ('C200','C300','C400','C500'), 1, NULL)) AS enrollment_counter,
+cd.campaign_id AS campaign_code,
+cd.queue_id AS queue_id,
+CASE WHEN getCallResponseValue(8161, ch.call_history_id, cd.client_id) = 1 THEN 'FH14VPPEKIT'
+ELSE IFNULL(getCallResponseValue(7361, ch.call_history_id, cd.client_id), concat(getCallResponseValue(6991, ch.call_history_id, cd.client_id), ' - ', getCallResponseValue(7001, ch.call_history_id, cd.client_id))) END AS kit_code,
+CASE WHEN getCallResponseValue(6711, ch.call_history_id, cd.client_id) IS NOT NULL THEN 'Y' ELSE 'N' END AS escalation_flag, -- Y/N
+getCallResponseValue(7171, ch.call_history_id, cd.client_id) AS seminar_id,
+NULL AS future_effective_date,
+-- IF(ch.call_termination_id IN (344,345,377),getCallResponseValue(1211, ch.call_history_id, cd.client_id),NULL) AS HV_scheduled_date,
+-- IF(ch.call_termination_id IN (344,345,377),getCallResponseValue(1221, ch.call_history_id, cd.client_id),NULL) AS HV_scheduled_time,
+IF(getAetnaDispositionCode(ch.call_termination_id, ch.call_termination_type, ch.call_history_id, cd.client_id) IN ('B100','J100','G200'), getCallResponseValue(1211, ch.call_history_id, cd.client_id),NULL) AS HV_scheduled_date,
+IF(getAetnaDispositionCode(ch.call_termination_id, ch.call_termination_type, ch.call_history_id, cd.client_id) IN ('B100','J100','G200'), getCallResponseValue(1221, ch.call_history_id, cd.client_id),NULL) AS HV_scheduled_time,
+scrubText(UPPER(COALESCE(getCallResponseValue(1231, ch.call_history_id, cd.client_id), getCallResponseValue(8399, ch.call_history_id, cd.client_id)))) AS alternate_home_appointment_location,
+-- concat(cd.client_id, '-', cd.`uuid`) AS ivr_unique_id,
+cdi.client_uuid AS ivr_unique_id,
+getCallResponseValue(2981, ch.call_history_id, cd.client_id) AS Ethnicity,
+scrubText(CASE 
+	WHEN cd.campaign_id IN (1116,1212) THEN -- should match the HSN queue list below
+			CONCAT(getCallResponseValue(10985, ch.call_history_id, cd.client_id), '; ', getCallResponseValue(10986, ch.call_history_id, cd.client_id), '; ', getCallResponseValue(10987, ch.call_history_id, cd.client_id), '; ', getCallResponseValue(10988, ch.call_history_id, cd.client_id))
+	ELSE
+			UPPER(COALESCE(getCallResponseValue(8400, ch.call_history_id, cd.client_id),getCallResponseValue(8413, ch.call_history_id, cd.client_id)))
+END) AS notes,
+'INDIVIDUAL' AS plan_type,
+1 AS interaction_file
+FROM ods_call_details cd
+INNER JOIN ods_call_history_links l ON l.uuid = cd.uuid AND l.client_id = cd.client_id
+INNER JOIN ods_call_histories ch ON ch.call_history_id = l.call_history_id AND ch.client_id = cd.client_id
+INNER JOIN ods_employees e ON e.employee_id = IFNULL(ch.employee_id, cd.employee_id) AND e.client_id = cd.client_id
+-- LEFT JOIN aetna_DID_TFN_matrix dtm ON dtm.DID = cd.number_dialed AND cd.call_type_id = 3
+LEFT JOIN aetna_campaign_info ci ON ci.campaign_id = cd.campaign_id
+LEFT JOIN ods_call_detail_interaction cdi ON cdi.qpcdr_id = cd.qpcdr_id AND cdi.client_id = cd.client_id 
+INNER JOIN interaction_campaigns ic ON ic.campaign_id = cd.campaign_id
+WHERE cd.call_list_id > 0
+AND cd.call_list_id IS NOT NULL
+AND call_type_id IN (1,3)
+AND DATE(CONVERT_TZ(start_time,'UTC','US/Mountain')) = '{$this->mysql_report_day}'
+GROUP BY cd.client_id, cd.uuid
+ORDER BY cd.start_time";
+
+		$data = $this->db->query(false);
+		// UPDATE city, state and zip data
+		$this->db->sql = "UPDATE {$this->interaction_data_table} id
+			SET id.state = UPPER((SELECT cc.state FROM WFM_data_warehouse.cvty_county2016 cc WHERE zip_code = zip LIMIT 1))
+			WHERE date_dim_id = (SELECT id FROM cxp_date_dim WHERE actual_date = '{$this->mysql_report_day}')
+			AND zip IS NOT NULL
+			AND state IS NULL";
+		$data = $this->db->query(false);
+			
+		$this->db->sql = "UPDATE {$this->interaction_data_table} id
+			SET id.county = UPPER((SELECT cc.county FROM WFM_data_warehouse.cvty_county2016 cc WHERE zip_code = zip AND split_county = 'N' GROUP BY cc.state, cc.county LIMIT 1))
+			WHERE date_dim_id = (SELECT id FROM cxp_date_dim WHERE actual_date = '{$this->mysql_report_day}')
+			AND zip IS NOT NULL
+			AND id.county IS NULL";
+		$data = $this->db->query(false);
+			
+		$this->db->sql = "UPDATE {$this->interaction_data_table} id
+			SET id.territory = UPPER((SELECT cc.territory FROM WFM_data_warehouse.cvty_county2016 cc WHERE cc.county = id.county AND cc.state = id.state GROUP BY cc.state, cc.territory))
+			WHERE date_dim_id = (SELECT id FROM cxp_date_dim WHERE actual_date = '{$this->mysql_report_day}')
+			AND id.state IS NOT NULL
+			AND id.county IS NOT NULL
+			AND id.territory IS NULL";
+		$data = $this->db->query(false);
+
+		// Make ratio for day
+		if($this->env == self::PRODUCTION && !$this->mid_day_run){
+			$this->db->sql = "INSERT IGNORE INTO ma_pdp_ratio (date_dim_id,ma_ratio,pdp_ratio)
+							SELECT 
+							(SELECT id FROM cxp_date_dim WHERE actual_date = STR_TO_DATE(interaction_date,'%m/%d/%Y')) date_dim_id,
+							SUM(IF(plan_interested_in_discussing like 'MA%',1,0))/SUM(IF(plan_interested_in_discussing like 'MA%' OR plan_interested_in_discussing like 'PDP%',1,0)) ma_ratio,
+							SUM(IF(plan_interested_in_discussing like 'PDP%',1,0))/SUM(IF(plan_interested_in_discussing like 'MA%' OR plan_interested_in_discussing like 'PDP%',1,0)) pdp_ratio
+							FROM {$this->interaction_data_table}
+							WHERE STR_TO_DATE(interaction_date,'%m/%d/%Y') = '{$this->mysql_report_day}'";
+			$data = $this->db->query(false);
+		}
+		// Make Interaction File
+		$this->db->sql = "SELECT `customer_id`, `contact_id`, `source_id`, `interaction_date`, DATE_FORMAT(STR_TO_DATE(`interaction_time`,'%h:%i:%s %p'),'%k:%i:%s %p'), `number_dialed`, `language_indicator`, `inbound_outbound`, `prospect_member_indicator`, `disposition_code`, `agent_id`, `ANI`, `first_name`, `middle_name`, `last_name`, `addr_line_1`, `addr_line_2`, `county`, `city`, `state`, `zip`, `territory`, `email`, `phone_number`, `email_opt_out`, `do_not_call`, `plan_interested_in_discussing`, `current_coverage`, `current_carrier`, `looking_for_coverage_reason`, `coverage_effective_date`, `medicaid_eligible`, `dental`, `enrollment_counter`, `campaign_code`, `kit_code`, `escalation_flag`, `seminar_id`, `future_effective_date`, `HV_scheduled_date`, `HV_scheduled_time`, `alternate_home_appointment_location`, `ivr_unique_id`, `Ethnicity`, `notes`, `plan_type`
+							FROM {$this->interaction_data_table}
+							WHERE date_dim_id = (SELECT id FROM cxp_date_dim WHERE actual_date = '{$this->mysql_report_day}') AND interaction_file";
+							//.($this->mid_day_run?" AND disposition_code IN ('J100','B100') AND !mid_day_sent":"");
+		$data = $this->db->query();
+		$this->cleanData($data);
+		
+		if(count($data) == 0){
+			$email = new Email();
+			if($this->env == self::PRODUCTION)
+				$email->to = "ksears@connexionpoint.com,cchristensen@connexionpoint.com";
+			if($this->env == self::TEST_LOCAL || $this->env == self::TEST_PRODUCTION)
+				$email->to = "cchristensen@connexionpoint.com,ksears@connexionpoint.com";
+			$email->subject = "	FAILURE: INTERACTION FILE IS EMPTY!";
+			$email->body = "Please check the interaction file, there seems to be an issue since it contains no data.";
+			$email->send();
+			exit();
+		}
+		
+		if($this->mid_day_run){
+			$transmitter = new Local_Transmitter("go.config.php",getcwd()."/temp_files/LeadInteractionFilecXp_".date('Ymd-ha').".csv");
+			
+			new CSV($headers,$data,$transmitter,getcwd()."/output_files/LeadInteractionFilecXp_".date('Ymd-ha').".csv",'');
+
+			if(!$this->email_only){
+				$transmitter = new Transmitter("go.config.php","/home/groupoffice/users/coventry/Coventry - Client Login/120214-120714 Lead Files/LeadInteractionFilecXp_".date('Ymd-ha').".txt");
+			
+				new DSV("|",$headers,$data,$transmitter,getcwd()."/output_files/LeadInteractionFilecXp_".date('Ymd-ha').".txt",'');
+				
+				$go_status = $transmitter->status; 
+			}
+		}else{
+			// CSV AND TRANSMITTER
+			// PRODUCTION
+			$transmitter = new Local_Transmitter("go.config.php",getcwd()."/temp_files/DailyInteractionFilecXp_".$this->additional_info_str.date('Ymd',strtotime('00:01 today')).".csv");
+			
+			new CSV($headers,$data,$transmitter,getcwd()."/output_files/DailyInteractionFilecXp_".$this->additional_info_str.date('Ymd',strtotime('00:01 today')).".csv",'');
+			
+			if(!$this->email_only){
+				// DSV AND TRANSMITTER
+				// PRODUCTION
+				if($this->env == self::PRODUCTION)
+					$transmitter = new Transmitter("go.config.php","/home/groupoffice/users/coventry/Coventry - Client Login/cXp Interaction File/DailyInteractionFilecXp_".date('Ymd',strtotime('00:01 today')).".txt");
+				// TEST - PRODUCTION
+				if($this->env == self::TEST_PRODUCTION)
+					$transmitter = new Transmitter("go.config.php","/home/groupoffice/users/reports/Coventry - Client Login/cXp Interaction File/DailyInteractionFilecXp_".date('Ymd',strtotime('00:01 today')).".txt");
+				// TEST - LOCAL
+				if($this->env == self::TEST_LOCAL)
+					$transmitter = new Local_Transmitter("go.config.php",getcwd()."/temp_files/DailyInteractionFilecXp_".date('Ymd',strtotime('00:01 today')).".txt");
+			
+				new DSV("|",$headers,$data,$transmitter,getcwd()."/output_files/DailyInteractionFilecXp_".date('Ymd',strtotime('00:01 today')).".txt",'');
+			
+				$go_status = $transmitter->status; 
+				
+				if(!$this->noinfogroup){
+					// DAT TRANSMITTER
+					// PRODUCTION
+					if($this->env == self::PRODUCTION)
+						$transmitter = new Transmitter("infogroup.config.php","/CNXP1I1/INFOGROUP_E08_CXP_".date('Ymd',strtotime('00:01 today')).".dat",true);
+					// TEST - PRODUCTION
+					if($this->env == self::TEST_PRODUCTION)
+						$transmitter = new Transmitter("go.config.php","/home/groupoffice/users/reports/Coventry - Client Login/cXp Interaction File/INFOGROUP_E08_CXP_".date('Ymd',strtotime('00:01 today')).".dat");
+					// TEST - LOCAL
+					if($this->env == self::TEST_LOCAL)
+						$transmitter = new Local_Transmitter("go.config.php",getcwd()."/temp_files/INFOGROUP_E08_CXP_".date('Ymd',strtotime('00:01 today')).".dat");
+				
+					$transmitter->transmitFile(getcwd()."/output_files/DailyInteractionFilecXp_".date('Ymd',strtotime('00:01 today')).".txt");
+				}
+			}
+		}
+		
+		$email = new Email();
+		
+		// PRODUCTION
+		if($this->env == self::PRODUCTION){
+			$email->to = "ksears@connexionpoint.com,cbaker@connexionpoint.com,bhunsaker@connexionpoint.com,sgautam@connexionpoint.com,tray@connexionpoint.com,jburnham@connexionpoint.com,diorg@connexionpoint.com";
+			$email->cc = "cchristensen@connexionpoint.com";
+		}
+		// TEST - LOCAL
+		if($this->env == self::TEST_LOCAL || $this->env == self::TEST_PRODUCTION)
+			$email->to = "cchristensen@connexionpoint.com,ksears@connexionpoint.com";
+		
+		$email->from = "reports@connexionpoint.com";
+		if($this->mid_day_run){
+			$email->subject = "Interaction Report Mid Day Run ".date('m-d-Y h A');
+			$email->body = "Interaction Report Mid Day ran at: ".date('m/d/Y h:i:s').' For date of: '.date('m-d-Y h A')."<br /><br />FILE CONTAINS ".count($data)." ROWS";
+		}else{
+			$email->subject = "{$this->additional_info_str}Interaction Report ".date('m-d-Y',strtotime($this->mysql_report_day));
+			$email->body = "Interaction Report ran at: ".date('m/d/Y h:i:s').' For date of: '.date('m-d-Y',strtotime($this->mysql_report_day))."<br /><br />FILE CONTAINS ".count($data)." ROWS";
+		}
+		if(!$this->email_only){
+			if($this->mid_day_run){
+				$email->body .= "<br /><br />MESSAGE FROM GO TRANSMIT:<br /> {$go_status} <br />";
+			}else{
+				$email->body .= "<br /><br />MESSAGE FROM GO TRANSMIT:<br /> {$go_status} <br /><br />MESSAGE FROM INFOGROUP TRANSMIT:<br /> {$transmitter->status}";
+			}
+		}
+		if($this->mid_day_run){
+			$email->addFile(getcwd()."/output_files/LeadInteractionFilecXp_".date('Ymd-ha').".csv","text/csv");
+		}else{
+			$email->addFile(getcwd()."/output_files/DailyInteractionFilecXp_".$this->additional_info_str.date('Ymd',strtotime('00:01 today')).".csv","text/csv");
+		}
+		$email->send();
+		
+		$this->db->sql = "UPDATE {$this->interaction_data_table} SET mid_day_sent = 1 WHERE date_dim_id = (SELECT id FROM cxp_date_dim WHERE actual_date = '{$this->mysql_report_day}') AND interaction_file ".($this->mid_day_run?" AND disposition_code IN ('J100','B100') AND !mid_day_sent":"");
+		$data = $this->db->query(false);
+		
+	}
+	
+	private function cleanData(&$data){
+		foreach($data as &$row){
+			foreach($row as $title => &$cell){
+				$cell = str_replace(array('\r\n','\n'),' - ',$cell);   
+				$cell = str_replace(array('\t'),' ',$cell);   
+				$cell = str_replace(array('"',"'",','),'',$cell);   
+				$cell = str_replace(array('MA / MAPD'),'MA',$cell);   
+				if($title == 'HV_scheduled_date' && $cell != '')
+					$cell = date('n/j/Y',strtotime($cell));
+				if($title == 'HV_scheduled_time' && $cell != '')
+					$cell = date('g:i A',strtotime($cell));
+   			}
+		}
+	}
+	
+	private function getHelp(){
+		echo "Interaction Report V2.0\r\n\r\nUsage:\tphp interaction.php --[option]\r\n\r\nOptions:\r\n\t--debug\t\tUse debug db config files instead of production\r\n\t--emailonly\tOnly emails CSV file, does not FTP files\r\n\t--env\t\tEnviroment to run as, accepts production, test or local\r\n\t--runas\t\tRun report as specific date, accepts any valid date string\r\n\t--noinfogroup\tSkip sending dat file to infogroup sftp\r\n\t--midday\tRunning interaction file in the middle of the day\r\n\t--help\t\tPrints help text\r\n\r\n";
+	}
+	
+}
+new Interaction();
